@@ -84,6 +84,15 @@ pub struct Session {
     codex_out_at_start: Option<u64>,
     codex_out_total: u64,
     asked_tool_ids: HashSet<String>,
+    /// Questions opened or settled by the lines fed so far (Codex).
+    pub ask_updates: Vec<AskUpdate>,
+    open_ask: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum AskUpdate {
+    Open(AgentAsk),
+    Close(String),
 }
 
 impl Session {
@@ -94,7 +103,13 @@ impl Session {
         }
     }
 
-    fn event(&self, kind: &'static str, message: String, at: i64, duration_ms: Option<i64>) -> AgentEvent {
+    fn event(
+        &self,
+        kind: &'static str,
+        message: String,
+        at: i64,
+        duration_ms: Option<i64>,
+    ) -> AgentEvent {
         let output_tokens = match self.agent {
             Some(Agent::Codex) => self
                 .codex_out_total
@@ -188,24 +203,40 @@ impl Session {
                         return None;
                     }
                     self.working = false;
-                    return Some(self.event("interrupted", String::new(), at, Some(at - self.started_at)));
+                    return Some(self.event(
+                        "interrupted",
+                        String::new(),
+                        at,
+                        Some(at - self.started_at),
+                    ));
                 }
                 self.begin_turn(at);
                 Some(self.event("working", String::new(), at, None))
             }
             "assistant" => {
                 let msg = v.get("message")?;
-                let id = msg.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                let id = msg
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 if let Some(u) = msg.get("usage") {
                     let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
                     self.out_by_msg.insert(id, n("output_tokens"));
-                    let ctx = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
+                    let ctx = n("input_tokens")
+                        + n("cache_read_input_tokens")
+                        + n("cache_creation_input_tokens");
                     if ctx > 0 {
                         self.context = ctx;
                     }
                 }
                 let mut question = None;
-                for item in msg.get("content").and_then(Value::as_array).into_iter().flatten() {
+                for item in msg
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
                     match item.get("type").and_then(Value::as_str) {
                         Some("text") => {
                             if let Some(t) = item.get("text").and_then(Value::as_str) {
@@ -214,8 +245,15 @@ impl Session {
                                 }
                             }
                         }
-                        Some("tool_use") if item.get("name").and_then(Value::as_str) == Some("AskUserQuestion") => {
-                            let tool_id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                        Some("tool_use")
+                            if item.get("name").and_then(Value::as_str)
+                                == Some("AskUserQuestion") =>
+                        {
+                            let tool_id = item
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
                             if self.asked_tool_ids.insert(tool_id) {
                                 question = item
                                     .pointer("/input/questions/0/question")
@@ -230,13 +268,108 @@ impl Session {
                     return Some(self.event("question", q, at, Some(at - self.started_at)));
                 }
                 match msg.get("stop_reason").and_then(Value::as_str) {
-                    Some("end_turn") | Some("stop_sequence") | Some("max_tokens") | Some("refusal") if self.working => {
+                    Some("end_turn")
+                    | Some("stop_sequence")
+                    | Some("max_tokens")
+                    | Some("refusal")
+                        if self.working =>
+                    {
                         self.working = false;
                         let text = self.last_text.clone();
                         Some(self.event("done", text, at, Some(at - self.started_at)))
                     }
                     _ => None,
                 }
+            }
+            _ => None,
+        }
+    }
+
+    fn settle_ask(&mut self) {
+        if let Some(id) = self.open_ask.take() {
+            self.ask_updates.push(AskUpdate::Close(id));
+        }
+    }
+
+    /// Codex asks with `request_user_input` (blocks the turn) or
+    /// `request_user_input_async` (desktop; answered by a later user message).
+    /// Neither can be answered from outside Codex, so the notch shows the
+    /// options and hands the chosen one over to paste.
+    fn codex_question_item(&mut self, p: &Value, at: i64) -> Option<AgentEvent> {
+        match p.get("type")?.as_str()? {
+            "function_call" => {
+                let name = p.get("name")?.as_str()?;
+                if name != "request_user_input" && name != "request_user_input_async" {
+                    return None;
+                }
+                let call_id = p.get("call_id")?.as_str()?.to_string();
+                let args: Value = serde_json::from_str(p.get("arguments")?.as_str()?).ok()?;
+                let s =
+                    |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                let questions: Vec<AskQuestion> = as_list(args.get("questions"))
+                    .into_iter()
+                    .map(|q| AskQuestion {
+                        question: if q.get("title").is_some() {
+                            s(q, "title")
+                        } else {
+                            s(q, "question")
+                        },
+                        header: s(q, "header"),
+                        multi_select: false,
+                        options: as_list(q.get("options"))
+                            .into_iter()
+                            .map(|o| match o {
+                                Value::String(label) => AskOption {
+                                    label: label.clone(),
+                                    description: String::new(),
+                                },
+                                _ => AskOption {
+                                    label: s(o, "label"),
+                                    description: s(o, "description"),
+                                },
+                            })
+                            .filter(|o| !o.label.is_empty())
+                            .collect(),
+                    })
+                    .filter(|q| !q.question.is_empty())
+                    .collect();
+                if questions.is_empty() {
+                    return None;
+                }
+                self.settle_ask();
+                let id = format!("codex-{call_id}");
+                let first = questions[0].question.clone();
+                self.ask_updates.push(AskUpdate::Open(AgentAsk {
+                    id: id.clone(),
+                    agent: "codex".into(),
+                    project: self.project.clone(),
+                    questions,
+                    answerable: false,
+                }));
+                self.open_ask = Some(id);
+                Some(self.event("question", first, at, Some(at - self.started_at)))
+            }
+            // The blocking form's answer.
+            "function_call_output" => {
+                let call_id = p.get("call_id")?.as_str()?;
+                if self.open_ask.as_deref() == Some(format!("codex-{call_id}").as_str())
+                    && p.get("output")
+                        .and_then(Value::as_str)
+                        .is_some_and(|o| o.contains("\"answers\""))
+                {
+                    self.settle_ask();
+                }
+                None
+            }
+            // The async form's answer: a user message naming the call.
+            "message" if p.get("role").and_then(Value::as_str) == Some("user") => {
+                let open = self.open_ask.clone()?;
+                let call_id = open.strip_prefix("codex-")?;
+                let text = p.to_string();
+                if text.contains("send_user_message_question_reply") && text.contains(call_id) {
+                    self.settle_ask();
+                }
+                None
             }
             _ => None,
         }
@@ -265,29 +398,48 @@ impl Session {
                 }
                 None
             }
+            "response_item" => self.codex_question_item(p, at),
             "event_msg" => match p.get("type")?.as_str()? {
                 "task_started" => {
-                    let start = p.get("started_at").and_then(Value::as_i64).map(|s| s * 1000).unwrap_or(at);
+                    self.settle_ask();
+                    let start = p
+                        .get("started_at")
+                        .and_then(Value::as_i64)
+                        .map(|s| s * 1000)
+                        .unwrap_or(at);
                     self.begin_turn(start);
                     Some(self.event("working", String::new(), at, None))
                 }
                 "token_count" => {
                     let info = p.get("info")?;
-                    if let Some(o) = info.pointer("/total_token_usage/output_tokens").and_then(Value::as_u64) {
+                    if let Some(o) = info
+                        .pointer("/total_token_usage/output_tokens")
+                        .and_then(Value::as_u64)
+                    {
                         self.codex_out_total = o;
                         if self.codex_out_at_start.is_none() {
                             self.codex_out_at_start = Some(o);
                         }
                     }
-                    if let Some(i) = info.pointer("/last_token_usage/input_tokens").and_then(Value::as_u64) {
+                    if let Some(i) = info
+                        .pointer("/last_token_usage/input_tokens")
+                        .and_then(Value::as_u64)
+                    {
                         self.context = i;
                     }
                     None
                 }
                 "task_complete" => {
                     self.working = false;
-                    let msg = p.get("last_agent_message").and_then(Value::as_str).unwrap_or("").to_string();
-                    let dur = p.get("duration_ms").and_then(Value::as_i64).or(Some(at - self.started_at));
+                    let msg = p
+                        .get("last_agent_message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let dur = p
+                        .get("duration_ms")
+                        .and_then(Value::as_i64)
+                        .or(Some(at - self.started_at));
                     Some(self.event("done", msg, at, dur))
                 }
                 "turn_aborted" => {
@@ -400,7 +552,9 @@ fn collect_jsonl(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
 }
 
 fn discover() -> Vec<(PathBuf, Agent)> {
-    let Some(home) = home() else { return Vec::new() };
+    let Some(home) = home() else {
+        return Vec::new();
+    };
     let mut found = Vec::new();
     let mut claude = Vec::new();
     // Depth 1: <project>/<session>.jsonl only; subagent transcripts sit deeper.
@@ -417,7 +571,9 @@ fn codex_titles() -> HashMap<String, String> {
     let Some(path) = home().map(|h| h.join(".codex").join("session_index.jsonl")) else {
         return titles;
     };
-    let Ok(file) = File::open(path) else { return titles };
+    let Ok(file) = File::open(path) else {
+        return titles;
+    };
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         if let Ok(v) = serde_json::from_str::<Value>(&line) {
             if let (Some(id), Some(name)) = (
@@ -443,7 +599,11 @@ fn prime(path: &Path, agent: Agent, from_start: bool) -> Option<Tail> {
         BufReader::new(&mut file).read_line(&mut first).ok()?;
         session.feed(first.trim_end());
     }
-    let start = if from_start { 0 } else { len.saturating_sub(PRIME_BYTES) };
+    let start = if from_start {
+        0
+    } else {
+        len.saturating_sub(PRIME_BYTES)
+    };
     if !from_start {
         file.seek(SeekFrom::Start(start)).ok()?;
         let mut buf = Vec::new();
@@ -456,15 +616,42 @@ fn prime(path: &Path, agent: Agent, from_start: bool) -> Option<Tail> {
         for line in lines {
             session.feed(line);
         }
-        return Some(Tail { session, offset: len, partial: String::new() });
+        // Keep a question still open in a recently active transcript.
+        let still_open: Vec<AgentAsk> = session
+            .ask_updates
+            .drain(..)
+            .filter_map(|u| match u {
+                AskUpdate::Open(a) => Some(a),
+                AskUpdate::Close(_) => None,
+            })
+            .filter(|a| session.open_ask.as_deref() == Some(a.id.as_str()))
+            .collect();
+        if recent_within(path, Duration::from_secs(20 * 60)) {
+            if let (Some(ask), Ok(mut asks)) = (still_open.into_iter().last(), ASKS.lock()) {
+                asks.push(ask);
+            }
+        }
+        return Some(Tail {
+            session,
+            offset: len,
+            partial: String::new(),
+        });
     }
-    Some(Tail { session, offset: 0, partial: String::new() })
+    Some(Tail {
+        session,
+        offset: 0,
+        partial: String::new(),
+    })
 }
 
 fn read_new(path: &Path, tail: &mut Tail) -> Vec<AgentEvent> {
     let mut events = Vec::new();
-    let Ok(mut file) = File::open(path) else { return events };
-    let Ok(len) = file.metadata().map(|m| m.len()) else { return events };
+    let Ok(mut file) = File::open(path) else {
+        return events;
+    };
+    let Ok(len) = file.metadata().map(|m| m.len()) else {
+        return events;
+    };
     if len < tail.offset {
         // Rewritten or truncated: start over.
         tail.offset = 0;
@@ -488,10 +675,227 @@ fn read_new(path: &Path, tail: &mut Tail) -> Vec<AgentEvent> {
     events
 }
 
+// ---------- Questions answered from the notch ----------
+//
+// An agent-side hook (scripts/bloom-ask-hook.ps1 for Claude Code) drops
+// `asks/<id>.json` with the question and its options and waits for
+// `asks/<id>.answer.json`. Removing the request file withdraws the question.
+
+const ASK_MAX_AGE: Duration = Duration::from_secs(330);
+
+#[derive(Clone, Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AskOption {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Clone, Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AskQuestion {
+    pub question: String,
+    pub header: String,
+    pub multi_select: bool,
+    pub options: Vec<AskOption>,
+}
+
+#[derive(Clone, Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAsk {
+    pub id: String,
+    pub agent: String,
+    pub project: String,
+    pub questions: Vec<AskQuestion>,
+    /// False when the notch can only offer the answer to paste (Codex).
+    pub answerable: bool,
+}
+
+static ASKS: Mutex<Vec<AgentAsk>> = Mutex::new(Vec::new());
+
+fn asks_dir() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("com.sehaz.bloom").join("asks"))
+}
+
+/// A one-element array may arrive as a bare object (PowerShell's JSON).
+fn as_list(v: Option<&Value>) -> Vec<&Value> {
+    match v {
+        Some(Value::Array(items)) => items.iter().collect(),
+        Some(Value::Null) | None => Vec::new(),
+        Some(other) => vec![other],
+    }
+}
+
+pub fn parse_ask(text: &str) -> Option<AgentAsk> {
+    let v: Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+    let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let questions: Vec<AskQuestion> = as_list(v.get("questions"))
+        .into_iter()
+        .map(|q| AskQuestion {
+            question: s(q, "question"),
+            header: s(q, "header"),
+            multi_select: q
+                .get("multiSelect")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            options: as_list(q.get("options"))
+                .into_iter()
+                .map(|o| AskOption {
+                    label: s(o, "label"),
+                    description: s(o, "description"),
+                })
+                .filter(|o| !o.label.is_empty())
+                .collect(),
+        })
+        .filter(|q| !q.question.is_empty())
+        .collect();
+    if questions.is_empty() {
+        return None;
+    }
+    Some(AgentAsk {
+        id: s(&v, "id"),
+        agent: s(&v, "agent"),
+        project: folder_name(&s(&v, "cwd")),
+        questions,
+        answerable: true,
+    })
+}
+
+#[tauri::command]
+pub fn get_agent_asks() -> Vec<AgentAsk> {
+    ASKS.lock().map(|a| a.clone()).unwrap_or_default()
+}
+
+/// Sends the user's answers (question → chosen label(s)), or `None` to
+/// release the question back to the agent's own UI.
+#[tauri::command]
+pub fn answer_agent_ask(
+    app: AppHandle,
+    id: String,
+    answers: Option<HashMap<String, String>>,
+) -> Result<(), String> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err("bad id".into());
+    }
+    // Codex questions are answered in Codex; the notch only dismisses them.
+    if id.starts_with("codex-") {
+        close_ask(&app, &id);
+        return Ok(());
+    }
+    let dir = asks_dir().ok_or("no APPDATA")?;
+    let body = serde_json::json!({ "answers": answers }).to_string();
+    let tmp = dir.join(format!("{id}.answer.tmp"));
+    std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, dir.join(format!("{id}.answer.json"))).map_err(|e| e.to_string())?;
+    close_ask(&app, &id);
+    Ok(())
+}
+
+fn open_ask(app: &AppHandle, ask: AgentAsk) {
+    if let Ok(mut asks) = ASKS.lock() {
+        asks.retain(|a| a.id != ask.id);
+        asks.push(ask.clone());
+    }
+    crate::services::follow_cursor_monitor(app);
+    let _ = app.emit("agent-ask", ask);
+}
+
+fn close_ask(app: &AppHandle, id: &str) {
+    let removed = ASKS
+        .lock()
+        .map(|mut asks| {
+            let before = asks.len();
+            asks.retain(|a| a.id != id);
+            before != asks.len()
+        })
+        .unwrap_or(false);
+    if removed {
+        let _ = app.emit("agent-ask-closed", id);
+    }
+}
+
+/// Picks up new questions and notices withdrawn ones.
+fn sync_asks(app: &AppHandle) {
+    let Some(dir) = asks_dir() else { return };
+    let mut on_disk = HashSet::new();
+    for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(id) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if id.ends_with(".answer") {
+            continue;
+        }
+        // The hook was killed (turn cancelled) and never cleaned up.
+        if !recent_within(&path, ASK_MAX_AGE) {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        // Answered; the hook removes both files once it has read the answer.
+        if dir.join(format!("{id}.answer.json")).exists() {
+            continue;
+        }
+        on_disk.insert(id.to_string());
+        let known = ASKS
+            .lock()
+            .map(|a| a.iter().any(|x| x.id == id))
+            .unwrap_or(true);
+        if known {
+            continue;
+        }
+        let Some(mut ask) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| parse_ask(&t))
+        else {
+            continue;
+        };
+        ask.id = id.to_string();
+        open_ask(app, ask);
+    }
+    let gone: Vec<String> = ASKS
+        .lock()
+        .map(|a| {
+            a.iter()
+                .filter(|x| x.agent == "claude" && !on_disk.contains(&x.id))
+                .map(|x| x.id.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    for id in gone {
+        close_ask(app, &id);
+    }
+}
+
+fn recent_within(path: &Path, age: Duration) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|a| a < age)
+}
+
 fn publish(app: &AppHandle, ev: AgentEvent) {
     if let Ok(mut latest) = LATEST.lock() {
         latest.retain(|e| e.agent != ev.agent);
         latest.push(ev.clone());
+    }
+    // A new prompt or an interrupt makes that agent's open question moot.
+    if ev.kind == "working" || ev.kind == "interrupted" {
+        let stale: Vec<String> = ASKS
+            .lock()
+            .map(|a| {
+                a.iter()
+                    .filter(|x| x.agent == ev.agent)
+                    .map(|x| x.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(dir) = asks_dir() {
+            for id in stale {
+                let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+                close_ask(app, &id);
+            }
+        }
     }
     if ev.kind != "working" {
         crate::services::follow_cursor_monitor(app);
@@ -527,9 +931,17 @@ pub fn setup_agent_watcher(app: AppHandle) {
                 first_scan = false;
             }
             tick = tick.wrapping_add(1);
+            sync_asks(&app);
 
             for (path, tail) in tails.iter_mut() {
-                for mut ev in read_new(path, tail) {
+                let events = read_new(path, tail);
+                for update in tail.session.ask_updates.drain(..) {
+                    match update {
+                        AskUpdate::Open(ask) => open_ask(&app, ask),
+                        AskUpdate::Close(id) => close_ask(&app, &id),
+                    }
+                }
+                for mut ev in events {
                     if ev.agent == "codex" && ev.title.is_empty() {
                         if let Some(t) = titles.get(&ev.session) {
                             ev.title = t.clone();
@@ -551,7 +963,10 @@ mod tests {
     fn parses_iso_timestamps() {
         assert_eq!(parse_iso_ms("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_iso_ms("1970-01-01T00:00:01.5Z"), Some(1500));
-        assert_eq!(parse_iso_ms("2026-11-07T05:43:29.548Z"), Some(1_794_030_209_548));
+        assert_eq!(
+            parse_iso_ms("2026-11-07T05:43:29.548Z"),
+            Some(1_794_030_209_548)
+        );
         assert_eq!(parse_iso_ms("garbage"), None);
     }
 
@@ -594,7 +1009,9 @@ mod tests {
             .unwrap();
         assert_eq!(i.kind, "interrupted");
         // Sidechain (subagent) traffic is ignored.
-        assert!(s.feed(r#"{"type":"user","isSidechain":true,"message":{"content":"sub"}}"#).is_none());
+        assert!(s
+            .feed(r#"{"type":"user","isSidechain":true,"message":{"content":"sub"}}"#)
+            .is_none());
     }
 
     #[test]
@@ -621,6 +1038,60 @@ mod tests {
             .feed(r#"{"type":"event_msg","payload":{"type":"turn_aborted","duration_ms":7141}}"#)
             .unwrap();
         assert_eq!((a.kind, a.duration_ms), ("interrupted", Some(7141)));
+    }
+
+    #[test]
+    fn parses_hook_requests_including_powershell_single_items() {
+        let ask = parse_ask(
+            "\u{feff}{\"id\":\"claude-1\",\"agent\":\"claude\",\"cwd\":\"C:\\\\p\\\\bloom\",\"questions\":{\"question\":\"Ship it?\",\"header\":\"Ship\",\"multiSelect\":false,\"options\":[{\"label\":\"Yes\",\"description\":\"push now\"},{\"label\":\"No\"}]}}",
+        )
+        .unwrap();
+        assert_eq!(ask.project, "bloom");
+        assert_eq!(ask.questions.len(), 1);
+        assert_eq!(
+            ask.questions[0].options[1],
+            AskOption {
+                label: "No".into(),
+                description: String::new()
+            }
+        );
+        assert!(parse_ask(r#"{"id":"x","questions":[]}"#).is_none());
+    }
+
+    #[test]
+    fn codex_questions_open_and_settle() {
+        let mut s = Session::new(Agent::Codex);
+        s.feed(r#"{"type":"session_meta","payload":{"id":"t1","cwd":"C:\\p\\mp3"}}"#);
+        // Desktop async form: string options, answered by a later user message.
+        let ev = s
+            .feed(r#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input_async","call_id":"call_A","arguments":"{\"questions\":[{\"title\":\"What player?\",\"options\":[\"Portable\",\"USB\"]}]}"}}"#)
+            .unwrap();
+        assert_eq!((ev.kind, ev.message.as_str()), ("question", "What player?"));
+        let AskUpdate::Open(ask) = s.ask_updates.remove(0) else {
+            panic!()
+        };
+        assert_eq!(ask.id, "codex-call_A");
+        assert_eq!(ask.project, "mp3");
+        assert_eq!(ask.questions[0].options[1].label, "USB");
+        assert!(!ask.answerable);
+        s.feed(r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_A","output":"{\"accepted\":true}"}}"#);
+        assert!(s.ask_updates.is_empty(), "accepted is not an answer");
+        s.feed(r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<send_user_message_question_reply>[{\"questionItemId\":\"[\\\"request_user_input_async\\\",\\\"call_A\\\",0]\",\"answer\":\"USB\"}]</send_user_message_question_reply>"}]}}"#);
+        assert_eq!(
+            s.ask_updates.remove(0),
+            AskUpdate::Close("codex-call_A".into())
+        );
+        // Blocking form: label/description options, answered by its output.
+        s.feed(r#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call_B","arguments":"{\"questions\":[{\"id\":\"src\",\"header\":\"Source\",\"question\":\"Files or Spotify?\",\"options\":[{\"label\":\"Files\",\"description\":\"offline\"}]}]}"}}"#);
+        let AskUpdate::Open(b) = s.ask_updates.remove(0) else {
+            panic!()
+        };
+        assert_eq!(b.questions[0].options[0].description, "offline");
+        s.feed(r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_B","output":"{\"answers\":{\"src\":{\"answers\":[\"Files\"]}}}"}}"#);
+        assert_eq!(
+            s.ask_updates.remove(0),
+            AskUpdate::Close("codex-call_B".into())
+        );
     }
 
     #[test]

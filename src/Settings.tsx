@@ -4,7 +4,7 @@ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { Effect } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { X, Settings, Palette, PanelTop, Monitor, Layers, Info, Megaphone } from "lucide-react";
+import { X, Settings, Palette, PanelTop, Monitor, Info, Megaphone } from "lucide-react";
 import {
 	useSettings,
 	GeneralTab,
@@ -27,7 +27,6 @@ const TABS: { id: SettingsTab; label: string; icon: typeof Settings }[] = [
 	{ id: "appearance", label: "Appearance", icon: Palette },
 	{ id: "notch", label: "Notch", icon: PanelTop },
 	{ id: "dock", label: "Dock", icon: Monitor },
-	{ id: "overlays", label: "Overlays", icon: Layers },
 	{ id: "about", label: "About", icon: Info }
 ];
 

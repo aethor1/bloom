@@ -200,6 +200,15 @@ pub async fn init_dock(app: AppHandle, mode: String) {
     }
 
     if let Some(dock_win) = app.get_webview_window("dock") {
+        // The page is unloaded while the dock is off (see main.rs).
+        if dock_win.url().is_ok_and(|u| u.scheme() == "about") {
+            if let Some(mut url) = app.get_webview_window("main").and_then(|m| m.url().ok()) {
+                url.set_path("/dock.html");
+                url.set_query(None);
+                url.set_fragment(None);
+                let _ = dock_win.navigate(url);
+            }
+        }
         // 1. Always show first — idempotent, required before any positioning
         if dock_win.show().is_err() {
             return;

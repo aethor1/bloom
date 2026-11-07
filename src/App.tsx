@@ -47,8 +47,11 @@ import {
 	AgentAlert,
 	AgentsPanel,
 	type AgentEvent,
+	type AgentAsk,
+	type AgentAsks,
 	type AgentName,
-	type AgentStates
+	type AgentStates,
+	type AskAnswer
 } from "./components/AgentIsland";
 import { Calendar, calendarRows } from "./components/Calendar";
 import { useConnectedDevices } from "./hooks/useConnectedDevices";
@@ -821,6 +824,13 @@ function App() {
 	const [agentStates, setAgentStates] = useState<AgentStates>({});
 	const [agentFresh, setAgentFresh] = useState<ReadonlySet<AgentName>>(() => new Set());
 	const [agentAlertActive, setAgentAlertActive] = useState(false);
+	// Questions an agent is waiting on; they hold the pill until settled.
+	const [agentAsks, setAgentAsks] = useState<AgentAsks>({});
+	const agentAsksRef = useRef<AgentAsks>({});
+	agentAsksRef.current = agentAsks;
+	const agentAskCount = Object.keys(agentAsks).length;
+	// Natural height of the agent alert / panel content, for the notch size.
+	const [agentContentHeight, setAgentContentHeight] = useState(54);
 	// Each connected earbud's own levels, as last reported, for Connected devices.
 	const [budsById, setBudsById] = useState<Record<string, BudsBattery>>({});
 	// The height the Connected devices panel's content needs; the open notch
@@ -2420,7 +2430,54 @@ function App() {
 		setBloomMode("agent");
 		if (notchMode === "peek" || notchMode === "smart") triggerEventPeek(duration);
 		if (agentAlertTimerRef.current) clearTimeout(agentAlertTimerRef.current);
-		agentAlertTimerRef.current = setTimeout(() => setAgentAlertActive(false), duration);
+		agentAlertTimerRef.current = setTimeout(
+			() => setAgentAlertActive(Object.keys(agentAsksRef.current).length > 0),
+			duration
+		);
+	};
+	// A question takes the pill until it is answered or withdrawn; with the
+	// notch open it shows in the Agents panel instead.
+	const presentAgentAskRef = useRef<(ask: AgentAsk) => void>(() => {});
+	presentAgentAskRef.current = (ask) => {
+		setAgentAsks((prev) => ({ ...prev, [ask.agent]: ask }));
+		setAgentFresh((prev) => new Set(prev).add(ask.agent));
+		if (agentAlertTimerRef.current) clearTimeout(agentAlertTimerRef.current);
+		if (isOpenRef.current) {
+			setBloomMode("agents");
+			return;
+		}
+		const mode = bloomModeRef.current;
+		if (mode === "announcement" || mode === "shelf") return;
+		setAgentAlertActive(true);
+		setBloomMode("agent");
+	};
+	const settleAgentAsk = (id: string) => {
+		const left = Object.fromEntries(
+			Object.entries(agentAsksRef.current).filter(([, a]) => a && a.id !== id)
+		) as AgentAsks;
+		agentAsksRef.current = left;
+		setAgentAsks(left);
+		if (Object.keys(left).length === 0) setAgentAlertActive(false);
+	};
+	const answerAgentAsk = (ask: AgentAsk, answer: AskAnswer) => {
+		if (ask.answerable) {
+			invoke("answer_agent_ask", { id: ask.id, answers: answer }).catch(console.error);
+			settleAgentAsk(ask.id);
+			return;
+		}
+		// Codex can't be answered from outside: copy the pick and bring Codex
+		// forward to paste it. The question clears once Codex records it.
+		if (answer) writeText(Object.values(answer).join("\n")).catch(() => {});
+		invoke<{ name: string; path: string; executable?: string | null; hwnd?: number | null }[]>(
+			"get_active_windows"
+		)
+			.then((apps) => {
+				const codex = apps.find(
+					(a) => a.hwnd && /codex/i.test(`${a.name} ${a.path} ${a.executable ?? ""}`)
+				);
+				if (codex?.hwnd) invoke("focus_window", { hwnd: codex.hwnd }).catch(() => {});
+			})
+			.catch(() => {});
 	};
 	const openAgentsPanel = () => {
 		if (agentAlertTimerRef.current) clearTimeout(agentAlertTimerRef.current);
@@ -2445,8 +2502,15 @@ function App() {
 			setAgentStates((prev) => ({ ...prev, [payload.agent]: payload }));
 			presentAgentAlertRef.current(payload);
 		});
+		invoke<AgentAsk[]>("get_agent_asks")
+			.then((list) => list.forEach((ask) => presentAgentAskRef.current(ask)))
+			.catch(() => {});
+		const unlistenAsk = listen<AgentAsk>("agent-ask", ({ payload }) => presentAgentAskRef.current(payload));
+		const unlistenAskClosed = listen<string>("agent-ask-closed", ({ payload }) => settleAgentAsk(payload));
 		return () => {
 			unlisten.then((f) => f());
+			unlistenAsk.then((f) => f());
+			unlistenAskClosed.then((f) => f());
 			if (agentAlertTimerRef.current) clearTimeout(agentAlertTimerRef.current);
 		};
 	}, [windowLabel]);
@@ -3194,8 +3258,8 @@ function App() {
 	const getDynamicWidth = () => {
 		if (bloomMode === "announcement" && announcement && !announcementDismissed) return 380;
 		if (bloomMode === "device" && deviceAlert) return 330;
-		if (bloomMode === "agent" && agentAlertActive) return 372;
-		if (bloomMode === "agents") return 560;
+		if (bloomMode === "agent" && agentAlertActive) return agentAskCount === 0 ? 372 : agentAskCount === 1 ? 560 : 860;
+		if (bloomMode === "agents") return agentAskCount ? 640 : 560;
 		if (isCalendarMode) return 480;
 		if (bloomMode === "shelf") return 380;
 		if (bloomMode === "command-center" && isOpen) return COMMAND_CENTER_WIDTH;
@@ -3230,8 +3294,8 @@ function App() {
 		}
 		// Device alert: the drawing, with room for its motion.
 		if (bloomMode === "device" && deviceAlert) return 76;
-		if (bloomMode === "agent" && agentAlertActive) return 54;
-		if (bloomMode === "agents") return 214;
+		if (bloomMode === "agent" && agentAlertActive) return Math.max(54, agentContentHeight);
+		if (bloomMode === "agents") return 36 + Math.max(120, agentContentHeight);
 		// Sized to the calendar's week-row count plus the timer's fixed content.
 		if (bloomMode === "calendar") return 112 + calendarRows(calendarMonth, calendarMondayFirst) * 30;
 		// Shelf expands on mode alone (no hover needed: there is no cursor
@@ -4359,11 +4423,27 @@ function App() {
 								    Agents panel with the details (open). */}
 								<AnimatePresence>
 									{bloomMode === "agent" && agentAlertActive && (
-										<AgentAlert key="agent-alert" states={agentStates} fresh={agentFresh} onOpen={openAgentsPanel} />
+										<AgentAlert
+											key="agent-alert"
+											states={agentStates}
+											asks={agentAsks}
+											fresh={agentFresh}
+											onOpen={openAgentsPanel}
+											onAnswer={answerAgentAsk}
+											onHeight={setAgentContentHeight}
+										/>
 									)}
 								</AnimatePresence>
 								<AnimatePresence>
-									{bloomMode === "agents" && <AgentsPanel key="agents-panel" states={agentStates} />}
+									{bloomMode === "agents" && (
+										<AgentsPanel
+											key="agents-panel"
+											states={agentStates}
+											asks={agentAsks}
+											onAnswer={answerAgentAsk}
+											onHeight={setAgentContentHeight}
+										/>
+									)}
 								</AnimatePresence>
 
 								{/* Announcement Card */}

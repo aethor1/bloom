@@ -94,10 +94,10 @@ fn dock_win_number_enabled() -> bool {
 /// Whether one of Bloom's HUD overlays is enabled (`bloom-volume-overlay-enabled`,
 /// `bloom-brightness-overlay-enabled`). With an overlay off, the matching keys
 /// and the native flyout are left to Windows instead of being taken over.
-fn overlay_enabled(app: &AppHandle, key: &str) -> bool {
-    crate::utils::get_setting_str(app, key)
-        .map(|v| v != "false")
-        .unwrap_or(true)
+fn overlay_enabled(_app: &AppHandle, _key: &str) -> bool {
+    // This fork has no HUD overlay window: volume/brightness keys and the
+    // native flyout always stay with Windows.
+    false
 }
 
 /// Physical Win state straight from the OS. The tracked flag can go stale when
@@ -1899,13 +1899,9 @@ pub fn set_native_osd_suppressed(suppress: bool) {
 /// suppressed while Bloom replaces both. With either overlay turned off, the
 /// user asked for the native flyout and it must stay visible.
 fn sync_native_osd(app_handle: &AppHandle) {
-    let enabled = |key: &str| {
-        get_setting_str(app_handle, key)
-            .map(|v| v != "false")
-            .unwrap_or(true)
-    };
     set_native_osd_suppressed(
-        enabled("bloom-brightness-overlay-enabled") && enabled("bloom-volume-overlay-enabled"),
+        overlay_enabled(app_handle, "bloom-brightness-overlay-enabled")
+            && overlay_enabled(app_handle, "bloom-volume-overlay-enabled"),
     );
 }
 
@@ -2487,8 +2483,12 @@ fn top_edge_dwell_ms(app_handle: &AppHandle) -> i64 {
 }
 
 /// Bounds of the monitor under `cursor`, in virtual-desktop pixels.
-fn monitor_rect_at(cursor: windows::Win32::Foundation::POINT) -> Option<windows::Win32::Foundation::RECT> {
-    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONULL};
+fn monitor_rect_at(
+    cursor: windows::Win32::Foundation::POINT,
+) -> Option<windows::Win32::Foundation::RECT> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONULL,
+    };
     unsafe {
         let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONULL);
         if monitor.is_invalid() {
@@ -2498,7 +2498,9 @@ fn monitor_rect_at(cursor: windows::Win32::Foundation::POINT) -> Option<windows:
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        GetMonitorInfoW(monitor, &mut info).as_bool().then_some(info.rcMonitor)
+        GetMonitorInfoW(monitor, &mut info)
+            .as_bool()
+            .then_some(info.rcMonitor)
     }
 }
 

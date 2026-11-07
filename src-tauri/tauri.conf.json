@@ -30,7 +30,8 @@
         "skipTaskbar": true,
         "shadow": false,
         "visible": false,
-        "dragDropEnabled": true
+        "dragDropEnabled": true,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --renderer-process-limit=1"
       },
       {
         "label": "settings",
@@ -51,28 +52,8 @@
         "skipTaskbar": false,
         "shadow": true,
         "visible": false,
-        "center": true
-      },
-      {
-        "label": "overlay",
-        "title": "Overlay",
-        "url": "overlay.html",
-        "width": 1920,
-        "height": 1080,
-        "x": 0,
-        "y": 0,
-        "decorations": false,
-        "transparent": true,
-        "resizable": false,
-        "maximizable": false,
-        "minimizable": false,
-        "closable": false,
-        "alwaysOnTop": true,
-        "visibleOnAllWorkspaces": true,
-        "focus": false,
-        "skipTaskbar": true,
-        "shadow": false,
-        "visible": false
+        "center": true,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --renderer-process-limit=1"
       },
       {
         "label": "dock",
@@ -93,7 +74,8 @@
         "focus": false,
         "skipTaskbar": true,
         "shadow": false,
-        "visible": false
+        "visible": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --renderer-process-limit=1"
       }
     ],
     "security": {

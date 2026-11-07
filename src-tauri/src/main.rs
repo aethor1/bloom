@@ -225,7 +225,9 @@ fn main() {
             bluetooth::bluetooth_refresh_buds,
             usb::usb_list_devices,
             jack::jack_list_devices,
-            agents::get_agent_states
+            agents::get_agent_states,
+            agents::get_agent_asks,
+            agents::answer_agent_ask
         ])
         .setup(|app| {
             init_taskbar_marker(app.handle());
@@ -264,6 +266,13 @@ fn main() {
             let _ = dock_win.set_ignore_cursor_events(true);
             if let Ok(hwnd) = dock_win.hwnd() {
                 DOCK_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+            }
+            // A disabled dock doesn't need its page loaded; init_dock loads it
+            // back when the dock is turned on. Saves a renderer's worth of RAM.
+            if !crate::utils::dock_enabled() {
+                if let Ok(blank) = "about:blank".parse() {
+                    let _ = dock_win.navigate(blank);
+                }
             }
 
             // Sync window rects initially and on event

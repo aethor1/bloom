@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import "./AgentIsland.css";
 
@@ -18,8 +18,26 @@ export interface AgentEvent {
 	at: number;
 }
 
+/** A question an agent is waiting on, answerable from the notch (`agent-ask`). */
+export interface AgentAsk {
+	id: string;
+	agent: AgentName;
+	project: string;
+	questions: {
+		question: string;
+		header: string;
+		multiSelect: boolean;
+		options: { label: string; description: string }[];
+	}[];
+	/** False for Codex: a pick is copied for pasting into Codex instead. */
+	answerable: boolean;
+}
+
 export type AgentName = "claude" | "codex";
 export type AgentStates = Partial<Record<AgentName, AgentEvent>>;
+export type AgentAsks = Partial<Record<AgentName, AgentAsk>>;
+/** Question text → chosen label(s), or null to answer in the agent's own app. */
+export type AskAnswer = Record<string, string> | null;
 
 /** Claude always takes the left side of the island, Codex the right. */
 export const AGENT_SIDES: readonly AgentName[] = ["claude", "codex"];
@@ -34,13 +52,6 @@ export function formatDuration(ms: number | null | undefined): string {
 	return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
 }
 
-export function formatTokens(n: number): string {
-	if (n < 1000) return `${n}`;
-	if (n < 100_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`;
-	if (n < 1_000_000) return `${Math.round(n / 1000)}k`;
-	return `${(n / 1_000_000).toFixed(2).replace(/0$/, "")}M`;
-}
-
 function ago(at: number, now: number): string {
 	const s = Math.max(0, Math.round((now - at) / 1000));
 	if (s < 10) return "just now";
@@ -53,7 +64,8 @@ function ago(at: number, now: number): string {
 
 type Status = "done" | "asks" | "question" | "working" | "interrupted" | "idle";
 
-function statusOf(ev: AgentEvent | undefined): Status {
+function statusOf(ev: AgentEvent | undefined, ask: AgentAsk | undefined): Status {
+	if (ask) return "question";
 	if (!ev) return "idle";
 	if (ev.kind === "done") return ev.asks ? "asks" : "done";
 	return ev.kind;
@@ -78,6 +90,21 @@ function useNow(active: boolean): number {
 		return () => window.clearInterval(id);
 	}, [active]);
 	return now;
+}
+
+/** Reports the element's natural height so the notch can grow to fit it. */
+function useReportHeight(onHeight: ((h: number) => void) | undefined) {
+	const ref = useRef<HTMLDivElement>(null);
+	useLayoutEffect(() => {
+		const el = ref.current;
+		if (!el || !onHeight) return;
+		const report = () => onHeight(Math.ceil(el.getBoundingClientRect().height / (parseFloat(getComputedStyle(el).zoom) || 1)));
+		report();
+		const ro = new ResizeObserver(report);
+		ro.observe(el);
+		return () => ro.disconnect();
+	}, [onHeight]);
+	return ref;
 }
 
 function turnDuration(ev: AgentEvent, now: number): number | null {
@@ -122,24 +149,121 @@ function MarkWithRing({ agent, status, fresh, size }: { agent: AgentName; status
 	);
 }
 
-/** Peek view: only what matters at a glance — who, what state, how long. */
+/** One pending question at a time, its options as buttons. Multi-select
+ *  questions toggle options and send with a button. */
+function AskView({ ask, onAnswer }: { ask: AgentAsk; onAnswer: (ask: AgentAsk, answer: AskAnswer) => void }) {
+	const [step, setStep] = useState(0);
+	const [answers, setAnswers] = useState<Record<string, string>>({});
+	const [picked, setPicked] = useState<string[]>([]);
+	// A new question replaces whatever was half answered.
+	useEffect(() => {
+		setStep(0);
+		setAnswers({});
+		setPicked([]);
+	}, [ask.id]);
+	const q = ask.questions[Math.min(step, ask.questions.length - 1)];
+	const commit = (value: string) => {
+		const next = { ...answers, [q.question]: value };
+		setPicked([]);
+		if (step + 1 < ask.questions.length) {
+			setAnswers(next);
+			setStep(step + 1);
+		} else {
+			onAnswer(ask, next);
+		}
+	};
+	return (
+		<div className="agent-ask" onClick={(e) => e.stopPropagation()}>
+			<div className="agent-ask-head">
+				<span className="agent-ask-who">
+					{LABEL[ask.agent]} needs you{ask.project ? <span className="agent-ask-project"> · {ask.project}</span> : null}
+				</span>
+				{ask.questions.length > 1 && (
+					<span className="agent-ask-step">
+						{step + 1}/{ask.questions.length}
+					</span>
+				)}
+			</div>
+			<motion.p key={`${ask.id}-${step}`} className="agent-ask-question" initial={{ opacity: 0, y: 3 }} animate={{ opacity: 1, y: 0 }}>
+				{q.question}
+			</motion.p>
+			<div className="agent-ask-options">
+				{q.options.map((o, i) => {
+					const on = picked.includes(o.label);
+					return (
+						<motion.button
+							key={`${step}-${o.label}`}
+							type="button"
+							className={`agent-ask-option ${on ? "on" : ""}`}
+							title={o.description || undefined}
+							initial={{ opacity: 0, scale: 0.94 }}
+							animate={{ opacity: 1, scale: 1 }}
+							transition={{ delay: 0.03 * i, type: "spring", stiffness: 520, damping: 30 }}
+							whileTap={{ scale: 0.95 }}
+							onClick={() => {
+								if (!q.multiSelect) return commit(o.label);
+								setPicked((p) => (on ? p.filter((x) => x !== o.label) : [...p, o.label]));
+							}}
+						>
+							<span className="agent-ask-option-label">{o.label}</span>
+							{o.description && <span className="agent-ask-option-desc">{o.description}</span>}
+						</motion.button>
+					);
+				})}
+			</div>
+			<div className="agent-ask-foot">
+				{!ask.answerable && <span className="agent-ask-hint">A pick is copied — paste it in Codex</span>}
+				<button type="button" className="agent-ask-release" onClick={() => onAnswer(ask, null)}>
+					{ask.answerable ? "Answer in app" : "Open Codex"}
+				</button>
+				{q.multiSelect && (
+					<button
+						type="button"
+						className="agent-ask-send"
+						disabled={picked.length === 0}
+						onClick={() => commit(picked.join(", "))}
+					>
+						Send
+					</button>
+				)}
+			</div>
+		</div>
+	);
+}
+
+/** Peek view: who, what state, how long — and, for a side waiting on you,
+ *  the question with its answers. */
 export function AgentAlert({
 	states,
+	asks,
 	fresh,
-	onOpen
+	onOpen,
+	onAnswer,
+	onHeight
 }: {
 	states: AgentStates;
+	asks: AgentAsks;
 	fresh: ReadonlySet<AgentName>;
 	onOpen: () => void;
+	onAnswer: (ask: AgentAsk, answer: AskAnswer) => void;
+	onHeight?: (h: number) => void;
 }) {
 	const working = AGENT_SIDES.some((a) => states[a]?.kind === "working");
 	const now = useNow(working);
+	const ref = useReportHeight(onHeight);
+	const asking = AGENT_SIDES.filter((a) => asks[a]);
 	return (
 		<motion.div
-			className="agent-alert"
+			ref={ref}
+			className={`agent-alert ${asking.length ? "has-ask" : ""}`}
+			style={{
+				gridTemplateColumns: asking.length
+					? AGENT_SIDES.map((a) => (asks[a] ? "minmax(0, 1fr)" : "auto")).join(" ")
+					: undefined
+			}}
 			onClick={(e) => {
 				e.stopPropagation();
-				onOpen();
+				if (!asking.length) onOpen();
 			}}
 			initial={{ opacity: 0 }}
 			animate={{ opacity: 1 }}
@@ -148,27 +272,36 @@ export function AgentAlert({
 		>
 			{AGENT_SIDES.map((agent) => {
 				const ev = states[agent];
-				const isFresh = fresh.has(agent);
-				const status = statusOf(ev);
+				const ask = asks[agent];
+				const isFresh = fresh.has(agent) || !!ask;
+				const status = statusOf(ev, ask);
 				// A side with nothing new stays a quiet mark, keeping its place.
 				const loud = isFresh || status === "working";
 				return (
 					<motion.div
 						key={agent}
-						className={`agent-side side-${agent} ${loud ? "loud" : "quiet"}`}
+						layout
+						className={`agent-side side-${agent} ${loud ? "loud" : "quiet"} ${ask ? "asking" : ""}`}
 						initial={{ opacity: 0, x: agent === "claude" ? -8 : 8 }}
 						animate={{ opacity: 1, x: 0 }}
-						transition={{ type: "spring", stiffness: 420, damping: 32, delay: 0.05 }}
+						transition={{ type: "spring", stiffness: 420, damping: 32 }}
 					>
 						<MarkWithRing agent={agent} status={loud ? status : "idle"} fresh={isFresh} size={18} />
-						{loud && ev && (
-							<div className="agent-side-text">
-								<span className={`agent-side-status status-${status}`}>{STATUS_TEXT[status]}</span>
-								<span className="agent-side-meta">
-									{formatDuration(turnDuration(ev, now))}
-									{ev.project ? ` · ${ev.project}` : ""}
-								</span>
-							</div>
+						{ask ? (
+							<AskView ask={ask} onAnswer={onAnswer} />
+						) : (
+							loud &&
+							ev &&
+							// Next to a question, the other side stays compact.
+							!asking.length && (
+								<div className="agent-side-text">
+									<span className={`agent-side-status status-${status}`}>{STATUS_TEXT[status]}</span>
+									<span className="agent-side-meta">
+										{formatDuration(turnDuration(ev, now))}
+										{ev.project ? ` · ${ev.project}` : ""}
+									</span>
+								</div>
+							)
 						)}
 					</motion.div>
 				);
@@ -177,17 +310,20 @@ export function AgentAlert({
 	);
 }
 
-function Stat({ value, label }: { value: string; label: string }) {
-	return (
-		<div className="agent-stat">
-			<span className="agent-stat-value">{value}</span>
-			<span className="agent-stat-label">{label}</span>
-		</div>
-	);
-}
-
-function AgentCard({ agent, ev, now }: { agent: AgentName; ev: AgentEvent | undefined; now: number }) {
-	const status = statusOf(ev);
+function AgentCard({
+	agent,
+	ev,
+	ask,
+	now,
+	onAnswer
+}: {
+	agent: AgentName;
+	ev: AgentEvent | undefined;
+	ask: AgentAsk | undefined;
+	now: number;
+	onAnswer: (ask: AgentAsk, answer: AskAnswer) => void;
+}) {
+	const status = statusOf(ev, ask);
 	return (
 		<div className={`agent-card side-${agent} status-${status}`}>
 			<div className="agent-card-head">
@@ -196,12 +332,10 @@ function AgentCard({ agent, ev, now }: { agent: AgentName; ev: AgentEvent | unde
 				<span className={`agent-chip status-${status}`}>{STATUS_TEXT[status]}</span>
 				{ev && <span className="agent-card-ago">{ago(ev.at, now)}</span>}
 			</div>
-			{ev ? (
+			{ask ? (
+				<AskView ask={ask} onAnswer={onAnswer} />
+			) : ev ? (
 				<>
-					<div className="agent-card-title" title={ev.title || ev.project}>
-						{ev.title || ev.project || "Untitled session"}
-						{ev.title && ev.project && <span className="agent-card-project"> · {ev.project}</span>}
-					</div>
 					<p className={`agent-card-message ${status === "question" || status === "asks" ? "is-question" : ""}`}>
 						{ev.kind === "working"
 							? "Thinking…"
@@ -209,10 +343,12 @@ function AgentCard({ agent, ev, now }: { agent: AgentName; ev: AgentEvent | unde
 								? "You stopped this turn."
 								: ev.message || "No reply text."}
 					</p>
-					<div className="agent-stats">
-						<Stat value={formatDuration(turnDuration(ev, now))} label={ev.kind === "working" ? "so far" : "thought"} />
-						<Stat value={formatTokens(ev.outputTokens)} label="tokens out" />
-						<Stat value={formatTokens(ev.contextTokens)} label="context" />
+					<div className="agent-card-foot">
+						<span>{ev.project}</span>
+						<span>
+							{ev.kind === "working" ? "thinking " : "thought "}
+							<b>{formatDuration(turnDuration(ev, now))}</b>
+						</span>
 					</div>
 				</>
 			) : (
@@ -222,11 +358,23 @@ function AgentCard({ agent, ev, now }: { agent: AgentName; ev: AgentEvent | unde
 	);
 }
 
-/** Expanded view: both agents side by side, with the details. */
-export function AgentsPanel({ states }: { states: AgentStates }) {
+/** Expanded view: both agents side by side. */
+export function AgentsPanel({
+	states,
+	asks,
+	onAnswer,
+	onHeight
+}: {
+	states: AgentStates;
+	asks: AgentAsks;
+	onAnswer: (ask: AgentAsk, answer: AskAnswer) => void;
+	onHeight?: (h: number) => void;
+}) {
 	const now = useNow(true);
+	const ref = useReportHeight(onHeight);
 	return (
 		<motion.div
+			ref={ref}
 			className="agents-panel"
 			onClick={(e) => e.stopPropagation()}
 			initial={{ opacity: 0 }}
@@ -235,7 +383,7 @@ export function AgentsPanel({ states }: { states: AgentStates }) {
 			transition={{ type: "spring", stiffness: 400, damping: 30 }}
 		>
 			{AGENT_SIDES.map((agent) => (
-				<AgentCard key={agent} agent={agent} ev={states[agent]} now={now} />
+				<AgentCard key={agent} agent={agent} ev={states[agent]} ask={asks[agent]} now={now} onAnswer={onAnswer} />
 			))}
 		</motion.div>
 	);
