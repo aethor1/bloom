@@ -2486,24 +2486,83 @@ fn top_edge_dwell_ms(app_handle: &AppHandle) -> i64 {
         .clamp(0, 2000)
 }
 
-/// True when the cursor sits inside the top-edge hot band on the primary
-/// monitor. Shared by the dwell gate and top-edge hit-testing continuity.
-fn in_top_edge_band(cursor: windows::Win32::Foundation::POINT, scale: f64) -> bool {
-    let (mon_x, mon_y) = MH_CACHED_MON_POS
-        .lock()
-        .ok()
-        .and_then(|g| *g)
-        .unwrap_or((0, 0));
-    let mon_w = MH_CACHED_MON_SIZE
-        .lock()
-        .ok()
-        .and_then(|g| *g)
-        .map(|s| s.0 as i32)
-        .unwrap_or(1920);
+/// Bounds of the monitor under `cursor`, in virtual-desktop pixels.
+fn monitor_rect_at(cursor: windows::Win32::Foundation::POINT) -> Option<windows::Win32::Foundation::RECT> {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONULL};
+    unsafe {
+        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONULL);
+        if monitor.is_invalid() {
+            return None;
+        }
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        GetMonitorInfoW(monitor, &mut info).as_bool().then_some(info.rcMonitor)
+    }
+}
 
-    cursor.y <= (mon_y + (TOP_EDGE_BAND_PX * scale) as i32)
-        && cursor.x >= mon_x
-        && cursor.x <= (mon_x + mon_w)
+/// True when the cursor sits inside the top-edge hot band of whichever
+/// monitor it is on. Shared by the dwell gate and top-edge hit-testing
+/// continuity.
+fn in_top_edge_band(cursor: windows::Win32::Foundation::POINT, scale: f64) -> bool {
+    monitor_rect_at(cursor).is_some_and(|r| cursor.y <= r.top + (TOP_EDGE_BAND_PX * scale) as i32)
+}
+
+static MH_LAST_FOLLOW_MS: AtomicI64 = AtomicI64::new(0);
+
+/// Moves the notch window onto the monitor under `cursor` if it is on another
+/// one, so the island follows the cursor between screens. Fixed mode keeps
+/// its AppBar reservation on the primary monitor and never moves.
+fn follow_monitor_at(app_handle: &AppHandle, cursor: windows::Win32::Foundation::POINT) {
+    if notch_mode_reserves_work_area(get_setting_str(app_handle, "bloom-notch-mode").as_deref()) {
+        return;
+    }
+    let Some(target) = monitor_rect_at(cursor) else {
+        return;
+    };
+    let Some((pos, _)) = MAIN_WINDOW_RECT.lock().ok().and_then(|g| *g) else {
+        return;
+    };
+    if pos.x == target.left && pos.y == target.top {
+        return;
+    }
+    // MAIN_WINDOW_RECT updates on the Moved event; don't re-issue the move
+    // while that is still in flight.
+    let now = now_ms();
+    if now - MH_LAST_FOLLOW_MS.load(Ordering::Relaxed) < 400 {
+        return;
+    }
+    MH_LAST_FOLLOW_MS.store(now, Ordering::Relaxed);
+    let Some(main_win) = app_handle.get_webview_window("main") else {
+        return;
+    };
+    let width = (target.right - target.left) as u32;
+    let place = move |w: &tauri::WebviewWindow| {
+        let scale = w.scale_factor().unwrap_or(1.0);
+        let height = (420.0 * crate::utils::get_bloom_scale(w.app_handle()) * scale) as u32;
+        let _ = w.set_position(tauri::PhysicalPosition::new(target.left, target.top));
+        let _ = w.set_size(tauri::PhysicalSize::new(width, height));
+    };
+    place(&main_win);
+    // Crossing to a monitor with another DPI rescales the window after the
+    // move; size it again once the new scale factor is in effect.
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        place(&main_win);
+        if let Ok(hwnd) = main_win.hwnd() {
+            re_assert_topmost(hwnd);
+        }
+    });
+}
+
+/// Brings the island to the monitor the cursor is on now (used before an
+/// alert peeks the notch).
+pub fn follow_cursor_monitor(app_handle: &AppHandle) {
+    let mut pt = windows::Win32::Foundation::POINT::default();
+    if unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) }.is_ok() {
+        follow_monitor_at(app_handle, pt);
+    }
 }
 
 /// True once the cursor has stayed inside the top band long enough to count as
@@ -2587,6 +2646,10 @@ fn update_main_interaction(
 
     let in_notch_hover = NOTCH_IS_HOVERED.load(Ordering::Relaxed);
     let scale = main_win.scale_factor().unwrap_or(1.0);
+    // Reaching for the top edge of another monitor brings the island there.
+    if !in_notch_hover && in_top_edge_band(cursor, scale) {
+        follow_monitor_at(app_handle, cursor);
+    }
     // The top-edge reveal exists only to bring a hidden notch on screen: it is
     // dwell-gated, and fixed mode (always visible) skips it entirely. This is
     // about showing the notch — the hit-testing continuity below is separate

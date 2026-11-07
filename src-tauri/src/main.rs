@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agents;
 mod battery;
 mod bluetooth;
 mod buds;
@@ -223,7 +224,8 @@ fn main() {
             bluetooth::bluetooth_unpair,
             bluetooth::bluetooth_refresh_buds,
             usb::usb_list_devices,
-            jack::jack_list_devices
+            jack::jack_list_devices,
+            agents::get_agent_states
         ])
         .setup(|app| {
             init_taskbar_marker(app.handle());
@@ -385,6 +387,7 @@ fn main() {
             bluetooth::setup_bluetooth_notifications(app.handle().clone());
             usb::setup_usb_notifications(app.handle().clone());
             jack::setup_jack_notifications(app.handle().clone());
+            agents::setup_agent_watcher(app.handle().clone());
 
             // Listen for second-instance signal to open settings
             if let Some(&h_event) = SINGLE_INSTANCE_EVENT_HANDLE.get() {

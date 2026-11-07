@@ -43,6 +43,13 @@ import { deviceArtFor } from "./devices/deviceArtFor";
 import { deviceLookFor } from "./devices/deviceLooks";
 import type { BudLevel, BudsBattery } from "./devices/connectedDevices";
 import { ConnectedDevicesPanel } from "./components/ConnectedDevicesPanel";
+import {
+	AgentAlert,
+	AgentsPanel,
+	type AgentEvent,
+	type AgentName,
+	type AgentStates
+} from "./components/AgentIsland";
 import { Calendar, calendarRows } from "./components/Calendar";
 import { useConnectedDevices } from "./hooks/useConnectedDevices";
 import { isWiredAudio, usbArtFor, usbDisplayName, type UsbIdentity } from "./devices/usbArtFor";
@@ -83,8 +90,8 @@ import {
  *   Dragging files onto the notch also opens the shelf. Wheel/swipe switches
  *   between tool panels, including when a live activity occupies the pill.
  */
-type NotchPanel = "calendar" | "command-center" | "devices";
-const NOTCH_PANELS: readonly NotchPanel[] = ["calendar", "command-center", "devices"];
+type NotchPanel = "calendar" | "command-center" | "devices" | "agents";
+const NOTCH_PANELS: readonly NotchPanel[] = ["calendar", "command-center", "devices", "agents"];
 const asNotchPanel = (value: unknown): NotchPanel | null =>
 	NOTCH_PANELS.includes(value as NotchPanel) ? (value as NotchPanel) : null;
 
@@ -454,7 +461,9 @@ type BloomMode =
 	| "wifi"
 	| "bluetooth"
 	| "devices"
-	| "device";
+	| "device"
+	| "agents"
+	| "agent";
 
 // A device that just connected or disconnected, shown briefly in the pill.
 interface DeviceAlert {
@@ -807,6 +816,11 @@ function App() {
 		dismiss: dismissAnnouncement
 	} = useAnnouncement();
 	const [deviceAlert, setDeviceAlert] = useState<DeviceAlert | null>(null);
+	// Claude Code / Codex: the latest turn event of each, which of them have
+	// news not yet seen, and whether that news is taking the pill right now.
+	const [agentStates, setAgentStates] = useState<AgentStates>({});
+	const [agentFresh, setAgentFresh] = useState<ReadonlySet<AgentName>>(() => new Set());
+	const [agentAlertActive, setAgentAlertActive] = useState(false);
 	// Each connected earbud's own levels, as last reported, for Connected devices.
 	const [budsById, setBudsById] = useState<Record<string, BudsBattery>>({});
 	// The height the Connected devices panel's content needs; the open notch
@@ -897,6 +911,7 @@ function App() {
 	const isHidden =
 		!startupAnimating &&
 		!deviceAlertOnScreen &&
+		!agentAlertActive &&
 		((notchMode === "smart" && isOverlapped && interactionState === "none") ||
 			(notchMode === "peek" && interactionState === "none" && !eventPeek));
 
@@ -1674,7 +1689,8 @@ function App() {
 			prev === "shelf" ||
 			prev === "wifi" ||
 			prev === "bluetooth" ||
-			prev === "devices"
+			prev === "devices" ||
+			prev === "agents"
 				? restingModeRef.current
 				: prev
 		);
@@ -1929,6 +1945,7 @@ function App() {
 	function panelEnabled(panel: NotchPanel) {
 		if (panel === "calendar") return settingsCalendarEnabled;
 		if (panel === "command-center") return settingsControlsPanelEnabled;
+		if (panel === "agents") return true;
 		return settingsDevicesPanelEnabled;
 	}
 
@@ -2386,6 +2403,95 @@ function App() {
 		// openingPanel only reads settings state already in this render.
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [bloomMode, deviceAlert, collapsedMode]);
+
+	// Claude Code / Codex turns (see agents.rs). A finished turn or a question
+	// takes the pill for a few seconds like a device alert — Claude on the
+	// left, Codex on the right — and a click opens the Agents panel with the
+	// details. An open notch is never taken over; the news waits there.
+	const agentAlertTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const presentAgentAlertRef = useRef<(ev: AgentEvent) => void>(() => {});
+	presentAgentAlertRef.current = (ev) => {
+		if (ev.kind !== "done" && ev.kind !== "question") return;
+		setAgentFresh((prev) => new Set(prev).add(ev.agent));
+		const mode = bloomModeRef.current;
+		if (isOpenRef.current || mode === "announcement" || mode === "shelf") return;
+		const duration = ev.kind === "question" || ev.asks ? 12000 : 7000;
+		setAgentAlertActive(true);
+		setBloomMode("agent");
+		if (notchMode === "peek" || notchMode === "smart") triggerEventPeek(duration);
+		if (agentAlertTimerRef.current) clearTimeout(agentAlertTimerRef.current);
+		agentAlertTimerRef.current = setTimeout(() => setAgentAlertActive(false), duration);
+	};
+	const openAgentsPanel = () => {
+		if (agentAlertTimerRef.current) clearTimeout(agentAlertTimerRef.current);
+		setAgentAlertActive(false);
+		setAgentFresh(new Set());
+		setIsOpen(true);
+		setBloomMode("agents");
+	};
+
+	useEffect(() => {
+		if (windowLabel !== "main") return;
+		invoke<AgentEvent[]>("get_agent_states")
+			.then((list) =>
+				setAgentStates((prev) => {
+					const next = { ...prev };
+					for (const ev of list) if (!next[ev.agent]) next[ev.agent] = ev;
+					return next;
+				})
+			)
+			.catch(() => {});
+		const unlisten = listen<AgentEvent>("agent-event", ({ payload }) => {
+			setAgentStates((prev) => ({ ...prev, [payload.agent]: payload }));
+			presentAgentAlertRef.current(payload);
+		});
+		return () => {
+			unlisten.then((f) => f());
+			if (agentAlertTimerRef.current) clearTimeout(agentAlertTimerRef.current);
+		};
+	}, [windowLabel]);
+
+	// Seeing the panel counts as reading the news.
+	useEffect(() => {
+		if (bloomMode === "agents" && agentFresh.size > 0) setAgentFresh(new Set());
+	}, [bloomMode, agentFresh]);
+
+	// Back to the resting view once the alert is over.
+	useEffect(() => {
+		if (bloomMode === "agent" && !agentAlertActive) {
+			setBloomMode(isOpenRef.current ? openingPanel() : collapsedMode);
+		}
+		// openingPanel only reads settings state already in this render.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [bloomMode, agentAlertActive, collapsedMode]);
+
+	// In a dev build: __bloomAgent("claude", "done") fakes a finished turn.
+	useEffect(() => {
+		if (!import.meta.env.DEV) return;
+		(window as unknown as Record<string, unknown>).__bloomAgent = (
+			agent: AgentName = "claude",
+			kind: AgentEvent["kind"] = "done",
+			message = "Shipped the fix and ran the tests. Want me to push it?"
+		) => {
+			const now = Date.now();
+			const ev: AgentEvent = {
+				agent,
+				kind,
+				session: "dev",
+				title: "Make the island follow the cursor",
+				project: "bloom",
+				message,
+				asks: message.trim().endsWith("?"),
+				startedAt: now - 134000,
+				durationMs: kind === "working" ? null : 134000,
+				outputTokens: 12480,
+				contextTokens: 84200,
+				at: now
+			};
+			setAgentStates((prev) => ({ ...prev, [agent]: ev }));
+			presentAgentAlertRef.current(ev);
+		};
+	}, []);
 
 	// The collapsed notch always shows its current live activity: music while a
 	// session exists, the timer (with music in its bubble) once one is set, and
@@ -3088,6 +3194,8 @@ function App() {
 	const getDynamicWidth = () => {
 		if (bloomMode === "announcement" && announcement && !announcementDismissed) return 380;
 		if (bloomMode === "device" && deviceAlert) return 330;
+		if (bloomMode === "agent" && agentAlertActive) return 372;
+		if (bloomMode === "agents") return 560;
 		if (isCalendarMode) return 480;
 		if (bloomMode === "shelf") return 380;
 		if (bloomMode === "command-center" && isOpen) return COMMAND_CENTER_WIDTH;
@@ -3122,6 +3230,8 @@ function App() {
 		}
 		// Device alert: the drawing, with room for its motion.
 		if (bloomMode === "device" && deviceAlert) return 76;
+		if (bloomMode === "agent" && agentAlertActive) return 54;
+		if (bloomMode === "agents") return 214;
 		// Sized to the calendar's week-row count plus the timer's fixed content.
 		if (bloomMode === "calendar") return 112 + calendarRows(calendarMonth, calendarMondayFirst) * 30;
 		// Shelf expands on mode alone (no hover needed: there is no cursor
@@ -3596,7 +3706,11 @@ function App() {
 											<div
 												className="main-row"
 												// A device alert covers the whole pill.
-												style={bloomMode === "device" || deviceAlertOnScreen ? { visibility: "hidden" } : undefined}
+												style={
+													bloomMode === "device" || deviceAlertOnScreen || bloomMode === "agent"
+														? { visibility: "hidden" }
+														: undefined
+												}
 											>
 												<AnimatePresence mode="wait">
 													{(showPowerPulse || showLowBatteryPulse || showUpdatePulse) &&
@@ -4239,6 +4353,17 @@ function App() {
 											)}
 										</motion.div>
 									)}
+								</AnimatePresence>
+
+								{/* Claude / Codex: a finished turn or question (peek), and the
+								    Agents panel with the details (open). */}
+								<AnimatePresence>
+									{bloomMode === "agent" && agentAlertActive && (
+										<AgentAlert key="agent-alert" states={agentStates} fresh={agentFresh} onOpen={openAgentsPanel} />
+									)}
+								</AnimatePresence>
+								<AnimatePresence>
+									{bloomMode === "agents" && <AgentsPanel key="agents-panel" states={agentStates} />}
 								</AnimatePresence>
 
 								{/* Announcement Card */}
